@@ -866,7 +866,13 @@ func TestSparseStoreSerialization(t *testing.T) {
 		}
 		deserializedStore := NewSparseStore()
 		MergeWithProto(deserializedStore, store.ToProto())
-		assert.Equal(t, store, deserializedStore)
+		assert.Equal(t, store.counts.Len(), deserializedStore.counts.Len())
+		deserializedStore.ForEach(func(index int, count float64) (stop bool) {
+			expectedCount, ok := store.counts.Get(index)
+			assert.True(t, ok)
+			assert.Equal(t, count, expectedCount)
+			return false
+		})
 	}
 }
 

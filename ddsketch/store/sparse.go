@@ -11,18 +11,25 @@ import (
 
 	enc "github.com/DataDog/sketches-go/ddsketch/encoding"
 	"github.com/DataDog/sketches-go/ddsketch/pb/sketchpb"
+
+	"github.com/kamstrup/intmap"
 )
 
 type SparseStore struct {
-	counts map[int]float64
+	counts *intmap.Map[int, float64]
 }
 
 func NewSparseStore() *SparseStore {
-	return &SparseStore{counts: make(map[int]float64)}
+	return &SparseStore{counts: intmap.New[int, float64](0)}
 }
 
 func (s *SparseStore) Add(index int) {
-	s.counts[index]++
+	val, exists := s.counts.Get(index)
+	if exists {
+		s.counts.Put(index, val+1)
+	} else {
+		s.counts.Put(index, 1)
+	}
 }
 
 func (s *SparseStore) AddBin(bin Bin) {
@@ -33,14 +40,19 @@ func (s *SparseStore) AddWithCount(index int, count float64) {
 	if count == 0 {
 		return
 	}
-	s.counts[index] += count
+	val, exists := s.counts.Get(index)
+	if exists {
+		s.counts.Put(index, val+count)
+	} else {
+		s.counts.Put(index, count)
+	}
 }
 
 func (s *SparseStore) Bins() <-chan Bin {
-	orderedBins := s.orderedBins()
 	ch := make(chan Bin)
 	go func() {
 		defer close(ch)
+		orderedBins := s.orderedBins()
 		for _, bin := range orderedBins {
 			ch <- bin
 		}
@@ -49,38 +61,36 @@ func (s *SparseStore) Bins() <-chan Bin {
 }
 
 func (s *SparseStore) orderedBins() []Bin {
-	bins := make([]Bin, 0, len(s.counts))
-	for index, count := range s.counts {
+	bins := make([]Bin, 0, s.counts.Len())
+	s.counts.ForEach(func(index int, count float64) bool {
 		bins = append(bins, Bin{index: index, count: count})
-	}
+		return true
+	})
 	sort.Slice(bins, func(i, j int) bool { return bins[i].index < bins[j].index })
 	return bins
 }
 
 func (s *SparseStore) ForEach(f func(index int, count float64) (stop bool)) {
-	for index, count := range s.counts {
-		if f(index, count) {
-			return
-		}
-	}
+	s.counts.ForEach(func(index int, count float64) bool {
+		return !f(index, count)
+	})
 }
 
 func (s *SparseStore) Copy() Store {
-	countsCopy := make(map[int]float64)
-	for index, count := range s.counts {
-		countsCopy[index] = count
-	}
-	return &SparseStore{counts: countsCopy}
+	newStore := NewSparseStore()
+	s.counts.ForEach(func(index int, count float64) bool {
+		newStore.counts.Put(index, count)
+		return true
+	})
+	return newStore
 }
 
 func (s *SparseStore) Clear() {
-	for index := range s.counts {
-		delete(s.counts, index)
-	}
+	s.counts.Clear()
 }
 
 func (s *SparseStore) IsEmpty() bool {
-	return len(s.counts) == 0
+	return s.counts.Len() == 0
 }
 
 func (s *SparseStore) MaxIndex() (int, error) {
@@ -88,11 +98,12 @@ func (s *SparseStore) MaxIndex() (int, error) {
 		return 0, errUndefinedMaxIndex
 	}
 	maxIndex := minInt
-	for index := range s.counts {
+	s.counts.ForEach(func(index int, _ float64) bool {
 		if index > maxIndex {
 			maxIndex = index
 		}
-	}
+		return true
+	})
 	return maxIndex, nil
 }
 
@@ -101,20 +112,22 @@ func (s *SparseStore) MinIndex() (int, error) {
 		return 0, errUndefinedMinIndex
 	}
 	minIndex := maxInt
-	for index := range s.counts {
+	s.counts.ForEach(func(index int, _ float64) bool {
 		if index < minIndex {
 			minIndex = index
 		}
-	}
+		return true
+	})
 	return minIndex, nil
 }
 
 func (s *SparseStore) TotalCount() float64 {
-	totalCount := float64(0)
-	for _, count := range s.counts {
-		totalCount += count
-	}
-	return totalCount
+	total := 0.0
+	s.counts.ForEach(func(_ int, count float64) bool {
+		total += count
+		return true
+	})
+	return total
 }
 
 func (s *SparseStore) KeyAtRank(rank float64) int {
@@ -126,13 +139,10 @@ func (s *SparseStore) KeyAtRank(rank float64) int {
 			return bin.index
 		}
 	}
-	maxIndex, err := s.MaxIndex()
-	if err == nil {
-		return maxIndex
-	} else {
-		// FIXME: make Store's KeyAtRank consistent with MinIndex and MaxIndex
-		return 0
+	if len(orderedBins) > 0 {
+		return orderedBins[len(orderedBins)-1].index
 	}
+	return 0
 }
 
 func (s *SparseStore) MergeWith(store Store) {
@@ -144,9 +154,10 @@ func (s *SparseStore) MergeWith(store Store) {
 
 func (s *SparseStore) ToProto() *sketchpb.Store {
 	binCounts := make(map[int32]float64)
-	for index, count := range s.counts {
+	s.counts.ForEach(func(index int, count float64) bool {
 		binCounts[int32(index)] = count
-	}
+		return true
+	})
 	return &sketchpb.Store{BinCounts: binCounts}
 }
 
@@ -157,9 +168,11 @@ func (s *SparseStore) Reweight(w float64) error {
 	if w == 1 {
 		return nil
 	}
-	for index := range s.counts {
-		s.counts[index] *= w
-	}
+
+	s.counts.ForEach(func(index int, count float64) bool {
+		s.counts.Put(index, count*w)
+		return true
+	})
 	return nil
 }
 
@@ -168,12 +181,18 @@ func (s *SparseStore) Encode(b *[]byte, t enc.FlagType) {
 		return
 	}
 	enc.EncodeFlag(b, enc.NewFlag(t, enc.BinEncodingIndexDeltasAndCounts))
-	enc.EncodeUvarint64(b, uint64(len(s.counts)))
+	enc.EncodeUvarint64(b, uint64(s.counts.Len()))
 	previousIndex := 0
-	for index, count := range s.counts {
-		enc.EncodeVarint64(b, int64(index-previousIndex))
-		enc.EncodeVarfloat64(b, count)
-		previousIndex = index
+	bins := make([]Bin, 0, s.counts.Len())
+	s.counts.ForEach(func(index int, count float64) bool {
+		bins = append(bins, Bin{index: index, count: count})
+		return true
+	})
+	sort.Slice(bins, func(i, j int) bool { return bins[i].index < bins[j].index })
+	for _, bin := range bins {
+		enc.EncodeVarint64(b, int64(bin.index-previousIndex))
+		enc.EncodeVarfloat64(b, bin.count)
+		previousIndex = bin.index
 	}
 }
 
